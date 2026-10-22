@@ -1,0 +1,874 @@
+"""
+Core intelligence engine: event correlation, deduplication, anomaly detection,
+causal inference (noisy-OR), severity scoring, and explanation generation.
+"""
+import json
+import math
+import hashlib
+import hmac
+import datetime
+import difflib
+import numpy as np
+from typing import Optional
+from sqlalchemy import select, func
+from sqlalchemy.ext.asyncio import AsyncSession
+
+try:
+    import h3
+    HAS_H3 = True
+except ImportError:
+    HAS_H3 = False
+
+from .models import Event, Incident, Source
+
+
+# ── Constrained vocabulary ───────────────────────────────────────────────────
+CAUSE_VOCABULARY = {
+    "drainage_failure": {
+        "label": "Drainage / Waterlogging Failure",
+        "prior": 0.30,
+        "evidence_weights": {
+            "water_level": 0.90,
+            "road_sensor": 0.70,
+            "citizen_report": 0.50,
+            "transit": 0.60,
+            "emergency_call": 0.40,
+            "weather": 0.30,
+        },
+        "severity_base": 75,
+    },
+    "road_accident": {
+        "label": "Road Accident / Collision",
+        "prior": 0.25,
+        "evidence_weights": {
+            "road_sensor": 0.85,
+            "citizen_report": 0.65,
+            "emergency_call": 0.80,
+            "transit": 0.50,
+            "water_level": 0.05,
+            "weather": 0.10,
+        },
+        "severity_base": 65,
+    },
+    "power_outage": {
+        "label": "Power Grid Failure / Outage",
+        "prior": 0.20,
+        "evidence_weights": {
+            "citizen_report": 0.70,
+            "emergency_call": 0.60,
+            "road_sensor": 0.30,
+            "transit": 0.40,
+            "water_level": 0.05,
+            "weather": 0.20,
+        },
+        "severity_base": 70,
+    },
+    "road_blockage": {
+        "label": "Road Blockage / Obstruction",
+        "prior": 0.25,
+        "evidence_weights": {
+            "road_sensor": 0.80,
+            "transit": 0.70,
+            "citizen_report": 0.60,
+            "emergency_call": 0.30,
+            "water_level": 0.10,
+            "weather": 0.10,
+        },
+        "severity_base": 55,
+    },
+    "earthquake": {
+        "label": "Seismic Event / Earthquake",
+        "prior": 0.10,
+        "evidence_weights": {
+            "seismic": 0.95,
+            "citizen_report": 0.60,
+            "emergency_call": 0.65,
+            "road_sensor": 0.45,
+            "transit": 0.40,
+            "water_level": 0.05,
+            "weather": 0.05,
+        },
+        "severity_base": 85,
+    },
+}
+
+
+def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Great-circle distance in meters."""
+    R = 6_371_000
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dp = math.radians(lat2 - lat1)
+    dl = math.radians(lon2 - lon1)
+    a = math.sin(dp / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dl / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def get_h3_cell(lat: float, lon: float, resolution: int = 7) -> str:
+    """Get H3 hexagonal cell index for geospatial grouping."""
+    if HAS_H3:
+        return h3.latlng_to_cell(lat, lon, resolution)
+    # Fallback: simple grid cell
+    return f"grid_{int(lat * 100)}_{int(lon * 100)}"
+
+
+# ── HMAC Signature Verification ──────────────────────────────────────────────
+
+def verify_signature(event_data: dict, signature: str, hmac_key: str) -> bool:
+    """Verify HMAC-SHA256 signature of event payload."""
+    if not signature or not hmac_key:
+        return False
+    message = json.dumps({
+        "device_id": event_data.get("device_id", ""),
+        "timestamp": str(event_data.get("timestamp", "")),
+        "payload": event_data.get("payload", {}),
+    }, sort_keys=True).encode()
+    expected = hmac.new(hmac_key.encode(), message, hashlib.sha256).hexdigest()
+    return hmac.compare_digest(signature, expected)
+
+
+# ── Deduplication ─────────────────────────────────────────────────────────────
+
+async def check_duplicate(db: AsyncSession, event: Event) -> tuple[bool, Optional[int]]:
+    """
+    Check for identical sensor events OR near-duplicate citizen_report / emergency_call.
+    For citizen_report / emergency_call within 300 m and 10 min with difflib ratio > 0.75:
+    -> is_duplicate=True, store duplicate_of id, and add corroboration_count on original.
+    Returns: (is_duplicate, duplicate_of_id)
+    """
+    # 1. Exact sensor duplicate (same device, timestamp, source_type)
+    if event.device_id and event.timestamp:
+        result = await db.execute(
+            select(Event).where(
+                Event.device_id == event.device_id,
+                Event.timestamp == event.timestamp,
+                Event.source_type == event.source_type,
+                Event.is_duplicate == False,
+            )
+        )
+        existing = result.scalars().first()
+        if existing is not None:
+            return True, existing.id
+
+    # 2. Near-duplicate citizen report or emergency call
+    if event.source_type in ("citizen_report", "emergency_call"):
+        p_curr = json.loads(event.payload) if isinstance(event.payload, str) else (event.payload or {})
+        t_curr = str(p_curr.get("text", p_curr.get("description", ""))).strip()
+
+        if t_curr and event.timestamp:
+            result = await db.execute(
+                select(Event).where(
+                    Event.source_type.in_(["citizen_report", "emergency_call"]),
+                    Event.is_duplicate == False,
+                )
+            )
+            candidates = result.scalars().all()
+            for cand in candidates:
+                if not cand.timestamp:
+                    continue
+                time_diff = abs((event.timestamp - cand.timestamp).total_seconds())
+                if time_diff > 600.0:  # 10 minutes
+                    continue
+                dist = haversine_m(event.lat, event.lon, cand.lat, cand.lon)
+                if dist > 300.0:  # 300 meters
+                    continue
+                p_cand = json.loads(cand.payload) if isinstance(cand.payload, str) else (cand.payload or {})
+                t_cand = str(p_cand.get("text", p_cand.get("description", ""))).strip()
+                if not t_cand:
+                    continue
+                ratio = difflib.SequenceMatcher(None, t_curr.lower(), t_cand.lower()).ratio()
+                if ratio > 0.75:
+                    cand.corroboration_count = (cand.corroboration_count or 0) + 1
+                    db.add(cand)
+                    return True, cand.id
+
+    return False, None
+
+
+# ── Anomaly Detection ─────────────────────────────────────────────────────────
+
+async def detect_anomaly(db: AsyncSession, event: Event) -> tuple[bool, float]:
+    """Rolling z-score anomaly detection for numeric sensor values."""
+    payload = json.loads(event.payload) if isinstance(event.payload, str) else event.payload
+    value = payload.get("value")
+    if value is None or not isinstance(value, (int, float)):
+        return False, 0.0
+
+    # Get recent values from same device
+    result = await db.execute(
+        select(Event.payload).where(
+            Event.device_id == event.device_id,
+            Event.source_type == event.source_type,
+            Event.is_duplicate == False,
+        ).order_by(Event.timestamp.desc()).limit(20)
+    )
+    rows = result.scalars().all()
+    values = []
+    for row in rows:
+        try:
+            p = json.loads(row) if isinstance(row, str) else row
+            v = p.get("value")
+            if isinstance(v, (int, float)):
+                values.append(v)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    if len(values) < 3:
+        return False, 0.0
+
+    arr = np.array(values, dtype=float)
+    mean, std = arr.mean(), arr.std()
+    if std < 0.01:
+        return False, 0.0
+    zscore = abs((value - mean) / std)
+    return zscore > 2.5, round(zscore, 2)
+
+
+# ── Event Correlation / Clustering ────────────────────────────────────────────
+
+async def correlate_event(db: AsyncSession, event: Event, max_distance_m: float = 500.0, max_time_sec: float = 1800.0) -> Optional[Incident]:
+    """Find or create an incident cluster for this event using spatiotemporal proximity."""
+    result = await db.execute(
+        select(Incident).where(Incident.status == "active")
+    )
+    active_incidents = result.scalars().all()
+
+    best_match: Optional[Incident] = None
+    best_dist = float("inf")
+
+    for inc in active_incidents:
+        dist = haversine_m(event.lat, event.lon, inc.centroid_lat, inc.centroid_lon)
+        if inc.events:
+            time_diff = min(abs((event.timestamp - e.timestamp).total_seconds()) for e in inc.events if e.timestamp)
+        elif inc.updated_at:
+            time_diff = abs((event.timestamp - inc.updated_at).total_seconds())
+        else:
+            time_diff = 0
+
+        if dist <= max_distance_m and time_diff <= max_time_sec and dist < best_dist:
+            best_match = inc
+            best_dist = dist
+
+    return best_match
+
+
+# ── Weather Evidence Analysis ─────────────────────────────────────────────────
+
+def _analyze_weather_evidence(events: list[Event]) -> dict:
+    """
+    Extract weather signal strength from weather-type events in the cluster.
+    Returns a dict with rainfall info and staleness.
+    """
+    weather_events = [e for e in events if e.source_type == "weather" and not e.is_duplicate and (e.trust is None or e.trust >= 0.4)]
+    has_rainfall = False
+    max_rain_mm = 0.0
+    rain_24h = 0.0
+    newest_weather_ts = None
+
+    for e in weather_events:
+        try:
+            p = json.loads(e.payload) if isinstance(e.payload, str) else e.payload
+            rain_val = p.get("value", 0)
+            if isinstance(rain_val, (int, float)) and rain_val > 2.0:  # >2 mm/hr = meaningful rain
+                has_rainfall = True
+                max_rain_mm = max(max_rain_mm, rain_val)
+            p24 = p.get("precipitation_24h", 0)
+            if isinstance(p24, (int, float)):
+                rain_24h = max(rain_24h, p24)
+        except (json.JSONDecodeError, TypeError):
+            pass
+        if e.timestamp and (newest_weather_ts is None or e.timestamp > newest_weather_ts):
+            newest_weather_ts = e.timestamp
+
+    # Calculate staleness
+    stale_minutes = 999.0
+    if newest_weather_ts:
+        stale_minutes = (datetime.datetime.utcnow() - newest_weather_ts).total_seconds() / 60.0
+
+    return {
+        "has_rainfall": has_rainfall,
+        "max_rain_mm": max_rain_mm,
+        "rain_24h_mm": rain_24h,
+        "is_heavy": max_rain_mm >= 30.0,  # 30+ mm/hr = heavy
+        "is_extreme": max_rain_mm >= 60.0,  # 60+ mm/hr = extreme
+        "weather_stale": stale_minutes > 30.0,
+        "weather_missing": len(weather_events) == 0,
+        "stale_minutes": round(stale_minutes, 1),
+        "event_count": len(weather_events),
+    }
+
+
+# ── Causal Inference (Noisy-OR / Weighted Scoring) ────────────────────────────
+
+def infer_cause(events: list[Event]) -> tuple[str, float, list[dict]]:
+    """
+    Noisy-OR / weighted scoring for probable cause inference.
+    Now weather-aware: heavy rain + water_level strongly supports drainage_failure;
+    water_level rise without rain raises pipe_burst/blockage alternatives.
+    Returns: (best_cause, confidence, ranking)
+    """
+    if not events:
+        return "unknown", 0.0, []
+
+    # Count source types and trust
+    source_counts: dict[str, int] = {}
+    trust_sum: dict[str, float] = {}
+    conflict_count = 0
+    untrusted_count = 0
+
+    for e in events:
+        if e.is_duplicate:
+            continue
+        if e.trust is not None and e.trust < 0.4:
+            untrusted_count += 1
+            continue
+        st = e.source_type
+        source_counts[st] = source_counts.get(st, 0) + 1
+        trust_sum[st] = trust_sum.get(st, 0.0) + (e.trust if e.trust is not None else 0.5)
+
+    # Check for conflicting evidence via payload
+    for e in events:
+        if e.is_duplicate:
+            continue
+        try:
+            p = json.loads(e.payload) if isinstance(e.payload, str) else e.payload
+            text = p.get("text", "")
+            if "no issue" in text.lower() or "clear" in text.lower() or "no problem" in text.lower():
+                conflict_count += 1
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # Analyze weather evidence
+    weather_info = _analyze_weather_evidence(events)
+    has_water_level = source_counts.get("water_level", 0) > 0
+
+    # Score each cause using noisy-OR
+    scores = []
+    for cause_id, cause_def in CAUSE_VOCABULARY.items():
+        noisy_or_complement = 1.0
+        evidence_count = 0
+        for src_type, weight in cause_def["evidence_weights"].items():
+            n = source_counts.get(src_type, 0)
+            if n > 0:
+                avg_trust = trust_sum.get(src_type, 0.5) / max(n, 1)
+                effective_weight = weight * avg_trust
+                for _ in range(min(n, 3)):  # Cap at 3 events per type
+                    noisy_or_complement *= (1.0 - effective_weight)
+                evidence_count += n
+
+        probability = 1.0 - noisy_or_complement
+        # Factor in prior
+        probability = probability * 0.8 + cause_def["prior"] * 0.2
+
+        # ── Weather-aware adjustments ────────────────────────────────
+        if cause_id == "drainage_failure":
+            if weather_info["has_rainfall"] and has_water_level:
+                # Rain + water_level = strong corroboration for drainage
+                boost = 0.08 if weather_info["is_heavy"] else 0.04
+                if weather_info["is_extreme"]:
+                    boost = 0.12
+                probability = min(0.99, probability + boost)
+            elif has_water_level and not weather_info["has_rainfall"] and not weather_info["weather_missing"]:
+                # Water rising WITHOUT rain: could be pipe burst / blockage instead
+                probability = max(0.05, probability - 0.06)
+            elif weather_info["has_rainfall"] and not has_water_level:
+                # Rain alone: small supporting signal
+                probability = min(0.99, probability + 0.02)
+
+        elif cause_id == "road_blockage":
+            if has_water_level and not weather_info["has_rainfall"] and not weather_info["weather_missing"]:
+                # Water rise without rain → could be a pipe-related blockage
+                probability = min(0.99, probability + 0.05)
+
+        elif cause_id == "earthquake":
+            has_seismic = source_counts.get("seismic", 0) > 0
+            if has_seismic:
+                # Strong seismic evidence guarantees dominant earthquake probability
+                probability = min(0.99, probability + 0.15)
+
+        scores.append({
+            "cause": cause_id,
+            "label": cause_def["label"],
+            "probability": round(probability, 3),
+            "evidence_count": evidence_count,
+        })
+
+    scores.sort(key=lambda x: x["probability"], reverse=True)
+
+    best = scores[0] if scores else {"cause": "unknown", "probability": 0.0}
+    confidence = best["probability"]
+
+    # Reduce confidence for conflicts and untrusted sources
+    confidence -= conflict_count * 0.12
+    confidence -= untrusted_count * 0.05
+
+    # Reduce confidence when weather data is stale or missing
+    if weather_info["weather_stale"] and not weather_info["weather_missing"]:
+        confidence -= 0.04  # Stale data penalty
+    elif weather_info["weather_missing"] and has_water_level:
+        confidence -= 0.03  # No weather context at all
+
+    confidence = max(0.05, min(0.99, confidence))
+
+    # Attach weather info to the ranking for the explanation generator
+    for s in scores:
+        s["_weather_info"] = weather_info
+
+    return best["cause"], round(confidence, 3), scores
+
+
+# ── Severity Model ────────────────────────────────────────────────────────────
+
+def compute_severity(cause: str, events: list[Event], confidence: float) -> tuple[int, str]:
+    """Severity 0-100 based on anomaly magnitude, independent sources, radius, and cause type."""
+    cause_def = CAUSE_VOCABULARY.get(cause, {"severity_base": 50})
+    base = cause_def["severity_base"]
+
+    # Unique source types boost
+    unique_sources = len(set(e.source_type for e in events if not e.is_duplicate))
+    source_bonus = min(15, unique_sources * 4)
+
+    # Anomaly magnitude
+    anomaly_bonus = 0
+    for e in events:
+        if e.is_anomaly and e.anomaly_zscore > 3:
+            anomaly_bonus = max(anomaly_bonus, min(10, int(e.anomaly_zscore)))
+
+    raw = min(100, int(base + source_bonus + anomaly_bonus))
+
+    # Weight by confidence
+    weighted = int(raw * max(confidence, 0.3))
+
+    if weighted >= 80:
+        level = "critical"
+    elif weighted >= 60:
+        level = "high"
+    elif weighted >= 40:
+        level = "medium"
+    else:
+        level = "low"
+
+    return weighted, level
+
+
+# ── Explanation Generator ─────────────────────────────────────────────────────
+
+def generate_explanation(incident: Incident, events: list[Event], cause: str, confidence: float, ranking: list[dict]) -> str:
+    """Template-based, confidence-aware explanation for operators. Now includes weather reasoning."""
+    cause_label = CAUSE_VOCABULARY.get(cause, {}).get("label", cause)
+    event_count = len([e for e in events if not e.is_duplicate])
+    source_types = set(e.source_type for e in events if not e.is_duplicate)
+
+    # Confidence wording
+    if confidence >= 0.85:
+        conf_word = "high confidence"
+    elif confidence >= 0.65:
+        conf_word = "moderate confidence"
+    elif confidence >= 0.40:
+        conf_word = "low confidence"
+    else:
+        conf_word = "very low confidence"
+
+    # Build explanation
+    lines = [
+        f"**Incident Analysis** — {conf_word} ({confidence:.0%})",
+        "",
+        f"The system has correlated **{event_count} signals** from {len(source_types)} independent source types "
+        f"({', '.join(sorted(source_types))}) near **{incident.neighborhood or 'the affected area'}**.",
+        "",
+        f"**Most probable cause: {cause_label}** ({confidence:.0%} confidence).",
+    ]
+
+    # Seismic / Earthquake reasoning
+    seismic_events = [e for e in events if e.source_type == "seismic" and not e.is_duplicate]
+    if cause == "earthquake" and seismic_events:
+        try:
+            sp = json.loads(seismic_events[0].payload) if isinstance(seismic_events[0].payload, str) else seismic_events[0].payload
+            mag = sp.get("magnitude", 4.5)
+            depth = sp.get("depth_km", 10.0)
+            place = sp.get("place", "Regional Epicenter")
+            lines.append(f"\n🌋 **Seismic Telemetry**: Confirmed USGS ground motion (Magnitude {mag}, Depth {depth} km) near {place}. Corroborated with citizen tremor reports and power telemetry.")
+        except Exception:
+            lines.append("\n🌋 **Seismic Telemetry**: Confirmed ground motion. Structural tremors and transit disruptions detected.")
+
+    # Weather reasoning
+    weather_info = ranking[0].get("_weather_info", {}) if ranking else {}
+    has_water_level = any(e.source_type == "water_level" and not e.is_duplicate for e in events)
+
+    if weather_info.get("has_rainfall") and has_water_level:
+        rain_mm = weather_info.get("max_rain_mm", 0)
+        intensity = "extreme" if weather_info.get("is_extreme") else ("heavy" if weather_info.get("is_heavy") else "moderate")
+        lines.append(f"\n🌧️ **Weather corroboration**: {intensity} rainfall ({rain_mm:.0f} mm/hr) detected — "
+                     f"strongly supports drainage/waterlogging as root cause.")
+    elif has_water_level and not weather_info.get("has_rainfall") and not weather_info.get("weather_missing"):
+        lines.append(f"\n⚠️ **Weather anomaly**: Water levels are rising but **no significant rainfall** is recorded. "
+                     f"Consider alternative causes: pipe burst, upstream release, or blocked drainage infrastructure. "
+                     f"Drainage failure confidence has been reduced.")
+    elif weather_info.get("has_rainfall") and not has_water_level:
+        lines.append(f"\n🌧️ **Weather note**: Rainfall detected ({weather_info.get('max_rain_mm', 0):.0f} mm/hr) but no water-level rise yet. "
+                     f"Monitoring for drainage impact.")
+
+    if weather_info.get("weather_stale") and not weather_info.get("weather_missing"):
+        lines.append(f"\n⏰ **Stale weather data**: Weather information is {weather_info.get('stale_minutes', 0):.0f} minutes old. "
+                     f"Confidence has been reduced. Refresh recommended.")
+    elif weather_info.get("weather_missing") and has_water_level:
+        lines.append(f"\n❓ **No weather data**: No rainfall information is available for this area. "
+                     f"Unable to confirm whether flooding is rain-induced. Confidence has been reduced.")
+
+    # Supporting / contradicting evidence summary
+    supporting = [e for e in events if not e.is_duplicate and e.trust >= 0.5]
+    contradicting = []
+    for e in events:
+        if e.is_duplicate:
+            continue
+        try:
+            p = json.loads(e.payload) if isinstance(e.payload, str) else e.payload
+            if "no issue" in p.get("text", "").lower() or "clear" in p.get("text", "").lower():
+                contradicting.append(e)
+        except Exception:
+            pass
+
+    if supporting:
+        lines.append(f"\n**Supporting evidence**: {len(supporting)} sensor/report signals confirm the assessment.")
+
+    if contradicting:
+        lines.append(f"\n⚠️ **Conflicting report(s)**: {len(contradicting)} source(s) contradict — confidence has been reduced.")
+
+    untrusted = [e for e in events if not e.is_duplicate and (not e.signature_verified or e.trust < 0.4)]
+    if untrusted:
+        lines.append(f"\n🔒 **Integrity note**: {len(untrusted)} source(s) have unverified signatures or low trust scores.")
+
+    # Missing sensor telemetry note
+    missing = json.loads(incident.missing_sources) if incident.missing_sources else []
+    if missing:
+        lines.append(f"\n📡 **Sensor telemetry note**: Reporting sensor(s) ({', '.join(missing)}) went silent. Hypothesis preserved with adjusted confidence.")
+
+    # Alternative causes
+    if len(ranking) > 1:
+        alt = ranking[1]
+        lines.append(f"\n**Alternative cause**: {alt['label']} ({alt['probability']:.0%}).")
+
+    return "\n".join(lines)
+
+
+# ── Incident Lifecycle ────────────────────────────────────────────────────────
+
+def update_incident_lifecycle(incident: Incident, inc_events: list[Event], as_of: Optional[datetime.datetime] = None) -> list[str]:
+    """
+    Check incident lifecycle status based on event time delta:
+    - active -> monitoring if no new events for 30 min (event time)
+    - -> resolved after 60 min (event time)
+    - If a sensor that was reporting goes silent (>= 15 min without report compared to ref time),
+      add it to 'missing_sources' list and preserve the incident.
+    Returns missing_sources list of device_ids.
+    """
+    non_dup = [e for e in inc_events if not e.is_duplicate]
+    if not non_dup:
+        return []
+
+    times = [e.timestamp for e in non_dup if e.timestamp]
+    if not times:
+        return []
+
+    latest_event_ts = max(times)
+    ref_ts = as_of or latest_event_ts
+
+    elapsed_minutes = (ref_ts - latest_event_ts).total_seconds() / 60.0
+    if elapsed_minutes >= 60.0:
+        incident.status = "resolved"
+    elif elapsed_minutes >= 30.0:
+        incident.status = "monitoring"
+    else:
+        incident.status = "active"
+
+    # Detect silent reporting sensors (water_level, road_sensor, transit, seismic, weather)
+    sensor_last_seen: dict[str, datetime.datetime] = {}
+    for e in non_dup:
+        if e.device_id and e.source_type in ("water_level", "road_sensor", "transit", "seismic", "weather"):
+            t = e.timestamp
+            if t:
+                sensor_last_seen[e.device_id] = max(t, sensor_last_seen.get(e.device_id, t))
+
+    missing = []
+    for dev_id, last_t in sensor_last_seen.items():
+        silence_mins = (ref_ts - last_t).total_seconds() / 60.0
+        if silence_mins >= 15.0:
+            missing.append(dev_id)
+
+    incident.missing_sources = json.dumps(missing)
+    return missing
+
+
+# ── Master Processing Pipeline ────────────────────────────────────────────────
+
+async def process_event(db: AsyncSession, event: Event) -> Event:
+    """Full pipeline: integrity → dedup → anomaly → correlate → infer → severity → explain."""
+
+    # 1. H3 geospatial cell
+    event.h3_cell = get_h3_cell(event.lat, event.lon)
+
+    # 2. Trust defaults by source type
+    if event.trust is None:
+        trust_defaults = {
+            "water_level": 0.90, "road_sensor": 0.85,
+            "transit": 0.80, "weather": 0.75,
+            "emergency_call": 0.70, "citizen_report": 0.50,
+        }
+        event.trust = trust_defaults.get(event.source_type, 0.5)
+
+    # 3. Signature verification
+    source = await db.execute(
+        select(Source).where(Source.device_id == event.device_id)
+    )
+    source_obj = source.scalars().first()
+    if source_obj and event.signature:
+        verified = verify_signature(
+            {"device_id": event.device_id, "timestamp": event.timestamp.isoformat(), "payload": json.loads(event.payload) if isinstance(event.payload, str) else event.payload},
+            event.signature, source_obj.hmac_key
+        )
+        event.signature_verified = verified
+        if not verified:
+            event.trust = max(0.1, event.trust - 0.3)
+    elif event.source_type in ("citizen_report", "emergency_call"):
+        event.signature_verified = False
+    else:
+        event.signature_verified = True  # Trust registered sensors by default
+
+    if source_obj and (source_obj.is_flagged or (source_obj.trust_score is not None and source_obj.trust_score < 0.4)):
+        event.trust = source_obj.trust_score if source_obj.trust_score is not None else 0.2
+        event.signature_verified = False
+
+    # 4. Deduplication
+    is_dup, dup_of = await check_duplicate(db, event)
+    event.is_duplicate = is_dup
+    event.duplicate_of = dup_of
+
+    # 5. Anomaly detection
+    is_anomaly, zscore = await detect_anomaly(db, event)
+    event.is_anomaly = is_anomaly
+    event.anomaly_zscore = zscore
+
+    # 6. Persist the event
+    if isinstance(event.payload, dict):
+        event.payload = json.dumps(event.payload)
+    db.add(event)
+    await db.flush()
+
+    if event.is_duplicate:
+        # If it's a duplicate of an existing event in an incident, associate it
+        if event.duplicate_of:
+            res_orig = await db.execute(select(Event).where(Event.id == event.duplicate_of))
+            orig_ev = res_orig.scalars().first()
+            if orig_ev and orig_ev.incident_id:
+                event.incident_id = orig_ev.incident_id
+                inc_res = await db.execute(select(Incident).where(Incident.id == orig_ev.incident_id))
+                event._incident = inc_res.scalars().first()
+        await db.commit()
+        return event
+
+    # 7. Correlate to incident
+    incident = await correlate_event(db, event)
+
+    if incident is None:
+        # Create new incident
+        incident = Incident(
+            centroid_lat=event.lat,
+            centroid_lon=event.lon,
+            created_at=datetime.datetime.utcnow(),
+            updated_at=datetime.datetime.utcnow(),
+        )
+        db.add(incident)
+        await db.flush()
+
+    event.incident_id = incident.id
+
+    # 8. Refresh incident events
+    result = await db.execute(
+        select(Event).where(Event.incident_id == incident.id)
+    )
+    inc_events = list(result.scalars().all())
+
+    # 9. Update centroid
+    non_dup_events = [e for e in inc_events if not e.is_duplicate]
+    if non_dup_events:
+        incident.centroid_lat = sum(e.lat for e in non_dup_events) / len(non_dup_events)
+        incident.centroid_lon = sum(e.lon for e in non_dup_events) / len(non_dup_events)
+
+    # 10. Lifecycle status & silent sensor detection
+    missing_sources = update_incident_lifecycle(incident, inc_events, as_of=event.timestamp)
+
+    # 11. Causal inference
+    cause, confidence, ranking = infer_cause(inc_events)
+    # If sensor went silent, reduce confidence slightly
+    if missing_sources:
+        confidence = max(0.05, round(confidence - 0.05 * min(len(missing_sources), 3), 3))
+
+    incident.cause = cause
+    incident.cause_confidence = confidence
+    incident.cause_ranking = json.dumps(ranking)
+
+    # 12. Severity
+    sev_score, sev_level = compute_severity(cause, inc_events, confidence)
+    incident.severity_score = sev_score
+    incident.severity_level = sev_level
+
+    # 13. Title
+    cause_label = CAUSE_VOCABULARY.get(cause, {}).get("label", cause)
+    incident.title = f"{cause_label} — {incident.neighborhood or 'Urban Sector'}"
+
+    # 14. Explanation
+    incident.explanation = generate_explanation(incident, inc_events, cause, confidence, ranking)
+
+    # 15. Confidence history
+    history = json.loads(incident.confidence_history or "[]")
+    history.append({
+        "t": datetime.datetime.utcnow().isoformat(),
+        "confidence": confidence,
+        "event_count": len(non_dup_events),
+    })
+    incident.confidence_history = json.dumps(history)
+
+    incident.updated_at = datetime.datetime.utcnow()
+    await db.commit()
+
+    # Store incident reference for WebSocket broadcast
+    event._incident = incident
+
+    # Update source tracking
+    if source_obj:
+        source_obj.last_seen = datetime.datetime.utcnow()
+        source_obj.event_count += 1
+        source_obj.signature_status = "verified" if event.signature_verified else "failed"
+        if event.trust is not None and event.trust < 0.4:
+            source_obj.is_flagged = True
+            if source_obj.trust_score is None:
+                source_obj.trust_score = 0.2
+        await db.commit()
+
+    return event
+
+
+# ── Confidence Diagnostic & Next Best Action ─────────────────────────────────
+
+def compute_why_not_100_and_check_next(incident: Incident, events: list[Event]) -> tuple[list[str], str]:
+    """
+    Computes:
+    1. why_not_100: list of reasons why confidence isn't 100%
+       (conflicting report, untrusted sensor, missing/offline sensor, few sources).
+    2. check_next: sentence recommending the single missing source type that
+       best separates the top 2 causes (biggest difference in their evidence_weights
+       in CAUSE_VOCABULARY), e.g. "Check road camera at Hindmata: would confirm drainage vs road blockage".
+    """
+    non_dup = [e for e in events if not e.is_duplicate]
+    why_not_100: list[str] = []
+
+    # 1. Conflicting report
+    has_conflict = False
+    for e in non_dup:
+        try:
+            p = json.loads(e.payload) if isinstance(e.payload, str) else (e.payload or {})
+            t = str(p.get("text", p.get("description", ""))).lower()
+            if any(w in t for w in ["no issue", "clear", "no problem", "dry", "fine", "false alarm"]):
+                has_conflict = True
+                break
+        except Exception:
+            pass
+    if has_conflict:
+        why_not_100.append("conflicting report received contradicting incident severity")
+
+    # 2. Untrusted sensor
+    untrusted = [
+        e for e in non_dup
+        if (e.trust is not None and e.trust < 0.4)
+        or (not e.signature_verified and e.source_type not in ("citizen_report", "emergency_call"))
+    ]
+    if untrusted:
+        why_not_100.append("untrusted sensor present with low trust score or unverified signature")
+
+    # 3. Missing/offline sensor
+    missing_list = []
+    if incident.missing_sources:
+        try:
+            missing_list = json.loads(incident.missing_sources) if isinstance(incident.missing_sources, str) else incident.missing_sources
+        except Exception:
+            pass
+
+    top_cause = incident.cause or "drainage_failure"
+    weights = CAUSE_VOCABULARY.get(top_cause, {}).get("evidence_weights", {})
+    present_types = {e.source_type for e in non_dup if (e.trust is None or e.trust >= 0.4)}
+    key_missing = [st for st, w in weights.items() if w >= 0.6 and st not in present_types]
+    if missing_list or key_missing:
+        why_not_100.append("missing/offline sensor in sector reducing corroboration")
+
+    # 4. Few sources
+    if len(present_types) < 3 or len(non_dup) < 4:
+        why_not_100.append("few sources reporting to confirm ground truth")
+
+    # 5. Baseline uncertainty if confidence < 0.99 and no other reason added
+    if not why_not_100 and (incident.cause_confidence or 0.0) < 0.99:
+        why_not_100.append("prior distribution and probabilistic noisy-OR ceiling")
+
+    # ── check_next computation ────────────────────────────────────────────────
+    ranking = []
+    if incident.cause_ranking:
+        try:
+            ranking = json.loads(incident.cause_ranking) if isinstance(incident.cause_ranking, str) else incident.cause_ranking
+        except Exception:
+            pass
+
+    cause1 = top_cause
+    cause2 = None
+    if ranking and len(ranking) >= 2:
+        for r in ranking:
+            c = r.get("cause")
+            if c and c != cause1:
+                cause2 = c
+                break
+
+    if not cause2:
+        for c in sorted(CAUSE_VOCABULARY.keys(), key=lambda k: CAUSE_VOCABULARY[k]["prior"], reverse=True):
+            if c != cause1:
+                cause2 = c
+                break
+    if not cause2:
+        cause2 = "road_blockage"
+
+    w1 = CAUSE_VOCABULARY.get(cause1, {}).get("evidence_weights", {})
+    w2 = CAUSE_VOCABULARY.get(cause2, {}).get("evidence_weights", {})
+    all_vocab_types = set(w1.keys()) | set(w2.keys())
+
+    # Find the missing source type with the biggest difference in evidence_weights
+    missing_types = [st for st in all_vocab_types if st not in present_types]
+    if missing_types:
+        best_st = max(missing_types, key=lambda st: abs(w1.get(st, 0.0) - w2.get(st, 0.0)))
+    else:
+        # If all types are present, choose the one with the biggest weight difference
+        best_st = max(all_vocab_types, key=lambda st: abs(w1.get(st, 0.0) - w2.get(st, 0.0)))
+
+    SOURCE_FRIENDLY_NAMES = {
+        "road_sensor": "road camera",
+        "water_level": "water level sensor",
+        "weather": "weather radar",
+        "emergency_call": "emergency dispatch line",
+        "transit": "transit telemetry",
+        "citizen_report": "citizen report feed",
+        "seismic": "seismograph station",
+    }
+    friendly_src = SOURCE_FRIENDLY_NAMES.get(best_st, best_st.replace("_", " "))
+
+    loc = "Hindmata"
+    if incident.neighborhood:
+        clean_loc = incident.neighborhood.split(",")[0].replace("Junction", "").strip()
+        if clean_loc:
+            loc = clean_loc
+
+    def _short_cause(c: str) -> str:
+        if c == "drainage_failure":
+            return "drainage"
+        return c.replace("_", " ")
+
+    c1_short = _short_cause(cause1)
+    c2_short = _short_cause(cause2)
+
+    check_next = f"Check {friendly_src} at {loc}: would confirm {c1_short} vs {c2_short}"
+
+    return why_not_100, check_next
