@@ -1,0 +1,12 @@
+# GitHub CODEOWNERS — UrbanIncident Fusion
+
+# Person 1 (Lead / Full-Stack)
+* @saik-99
+/frontend/ @saik-99
+/backend/ @saik-99
+
+# Person 2 & 3 Collaborative Squad (Data, ML, Causal Engine & Pitch)
+/data_and_ml/ @teammate_person2 @teammate_person3 @saik-99
+
+# Person 4 (AI Agent Manager & Explainability)
+/agents/ @teammate_person4 @saik-99
